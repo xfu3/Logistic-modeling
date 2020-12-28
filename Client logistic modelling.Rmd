@@ -1,0 +1,303 @@
+---
+title: "Client project"
+author: "[Xilai Fu]"
+date: "Last updated: `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    css: style.css
+    theme: united
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: false
+    code_folding: hide
+    code_download: true
+bibliography: references.bib
+link-citations: true
+---
+# Introduction
+Our objective is to fit a logistic model based on model fitting(evaluated by AIC and Nagelkerke pseudo R2) and interpretability. Given a number of variables with missing values,it is of significance to predict **TB** versus **non-TB** in medical setting.
+```{r Load libraries,warning=FALSE,message = FALSE}
+library(Matrix)
+library(Ckmeans.1d.dp)
+library(RcppRoll)
+library(dplyr)
+library(ggplot2)
+library(DT)
+library(kableExtra)
+library(Hmisc)
+library(table1)
+library(MASS)
+library(DescTools)
+library(gridExtra)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+```
+
+
+```{r}
+bio_dat <-read.csv("tb_data_aggregated.csv", na.strings=c("","NA"))
+```
+
+# Data preprocessing
+Mandatory data manipulation:\
+1: Change "INC" into NA\
+2: Merge the levels Yes and yes for abscess_septation\
+3: Merge the levels None with No for disk_inv\
+4: Delete redundant variables **caseNo**,**dx_rad**,**dx_spine**\
+5: Encode the levels rather than **TB** as **non-TB**\
+
+
+Optional data manipulation:\
+1: Introduce additional variables **new_t2_bone_intensity** and **new_disk_intensity** which combine the levels **Hyperintense** and **Mixed** as 1 and **Hypointense** and **Isointense** as 0\
+2: Introduce additional variable **new_abscess_wall_thick** which encodes [>2mm] as 1 and [<=2mm] as 0\
+3: Delete the levels **Sacral**,**CT** junction(only one case) for site_primary\
+4: Combine the level **Paravertebral anterior**(only one sample) with **Paravertebral** for abscess_location_1
+```{r warning=FALSE,message = FALSE}
+## change "INC" into NA
+bio_dat[bio_dat=="INC"] <- NA
+
+## merge the levels Yes and yes
+bio_dat[bio_dat$abscess_septation%in%c("yes"),]$abscess_septation <- "Yes"
+
+## merge None with No
+bio_dat[bio_dat$disk_inv%in%c("None"),]$disk_inv <-"No"
+
+## delete redundent variables 
+bio_dat[,c("caseNo","dx_rad","dx_spine")] <-NULL
+
+## encode non-TB
+bio_dat[bio_dat$dx_correct!="TB","dx_correct"]<-"non-TB"
+
+
+## optional data manipulation
+## site_primary: Sacral,CT junction(only one case)
+## abscess_location_1: Paravertebral,Paravertebral anterior
+bio_dat<-bio_dat[!(bio_dat$site_primary%in%c("Sacral","CT junction")),]
+bio_dat[bio_dat$abscess_location_1 %in%c("Paravertebral","Paravertebral anterior"),]$abscess_location_1<-"Paravertebral"
+
+##c("Hyperintense","Mixed"),] assigned to 1, c("Hypointense","Isointense") to 0, and "Destroyed" to NA
+bio_dat$new_t2_disk_intensity<-bio_dat$t2_disk_intensity
+bio_dat[bio_dat$new_t2_disk_intensity%in%c("Hyperintense","Mixed"),]$new_t2_disk_intensity <-"1"
+bio_dat[bio_dat$new_t2_disk_intensity%in%c("Hypointense","Isointense"),]$new_t2_disk_intensity <-"0"
+bio_dat[bio_dat$new_t2_disk_intensity %in% c("Destroyed"),]$new_t2_disk_intensity <-NA
+bio_dat$new_t2_disk_intensity<-as.factor(bio_dat$new_t2_disk_intensity)
+
+##c("Hyperintense","Mixed"),] assigned to 1, c("Hypointense","Isointense") to 0(t2_bone_intensity)
+bio_dat$new_t2_bone_intensity<-bio_dat$t2_bone_intensity
+bio_dat$new_t2_bone_intensity<-as.character(bio_dat$new_t2_bone_intensity)
+bio_dat[bio_dat$new_t2_bone_intensity%in%c("Hyperintense","Mixed"),]$new_t2_bone_intensity <-"1"
+bio_dat[bio_dat$new_t2_bone_intensity%in%c("Hypointense","Isointense"),]$new_t2_bone_intensity <-"0"
+bio_dat$new_t2_bone_intensity<-as.factor(bio_dat$new_t2_bone_intensity)
+
+## abscess wall thickness (abscess_wall_thick) by thresholding at 2mm: [>2mm]=1 and [<=2mm]=0
+bio_dat$new_abscess_wall_thick<-bio_dat$abscess_wall_thick
+bio_dat[bio_dat$new_abscess_wall_thick<=2&!(is.na(bio_dat$new_abscess_wall_thick)),]$new_abscess_wall_thick <-0
+bio_dat[(bio_dat$new_abscess_wall_thick>2)&!(is.na(bio_dat$new_abscess_wall_thick)),]$new_abscess_wall_thick <-1
+bio_dat$new_abscess_wall_thick<-as.factor(bio_dat$new_abscess_wall_thick)
+```
+
+
+
+# Exploratory data analysis
+
+## Missing data visualization
+```{r warning=FALSE,fig.align='center',message = FALSE}
+## count of NAs column-wise
+miss_summary <-apply(bio_dat,2,function(x) sum(is.na(x)))
+na_summary<-as.data.frame(miss_summary)
+miss_columns <- row.names(na_summary)
+row.names(na_summary) <- seq(1,37,1)
+na_summary_1<-cbind(miss_columns,na_summary)
+
+## columns with missing values
+na_summary_1<-cbind(na_summary_1,variable_type = sapply(bio_dat, class))
+na_summary_1$variable_type<-sapply(na_summary_1$variable_type,function(x) ifelse(x %in% c("factor","character"),"factor","continuous"))
+
+missing<-na_summary_1[miss_summary != 0, ]
+
+## Visualization fo na values column-wise
+ggplot(data = missing, aes(
+  x = reorder(miss_columns, miss_summary),
+  y = miss_summary,
+  fill = variable_type
+)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = miss_summary),
+            vjust = 0, hjust = 0) + theme_light() + ylim(0, 50) +
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      vjust = 0,
+      hjust = 0
+    ),
+    legend.position = c(0.88, 0.117)
+  ) + labs(y = "Number of missing values", x = "Features") +
+  ggtitle("Missing values column wise") +
+  coord_flip()
+
+row_missing<-as.data.frame(apply(bio_dat,1,function(x) round(sum(is.na(x))/length(x),digits = 2)))
+colnames(row_missing)<-"row_missing_percentage"
+row_missing<-cbind(row_number=rownames(row_missing),row_missing)
+rownames(row_missing)<-NULL
+kable(row_missing)%>%
+add_header_above(c(" ", "Missing values percentage for each row" = 1))
+```
+
+## Feature selection 
+1:Exclude the variables with a large proportion of missing values(**t2_cord_intensity**,**cord_signal_abnormal**, and **kyphotic_num**)\
+
+2:Select the features with low p values\ 
+
+3:abscess_soft_tissue_1 and abscess_septation are correlated with abscess_location_1 based on their chi-square p value so I decided to delete abscess_location_1 and abscess_septation\
+
+4:After feature selection,we deleted the rows with missing values and we ended up with 12 variables and 82 rows.
+
+**Tests for accessing the correlation between variables**\
+1: Chi_square test for testing the correlation between categorical features and response\
+2: Two sample t test between continuous features and response
+
+### features and the reponse
+```{r warning=FALSE,message = FALSE}
+bio_dat$dx_correct_1<-factor(bio_dat$dx_correct, levels=c("TB", "non-TB", "P-value"), labels=c("TB", "non-TB", "P-value"))
+
+rndr <- function(x, name, ...) {
+    if (length(x) == 0) {
+        y <- bio_dat[[name]]
+        s <- rep("", length(render.default(x=y, name=name, ...)))
+        if (is.numeric(y)) {
+            p <- t.test(y ~ bio_dat$dx_correct_1)$p.value
+        } else {
+            p <- chisq.test(table(y, droplevels(bio_dat$dx_correct_1)))$p.value
+        }
+        s[2] <- sub("<", "&lt;", format.pval(p, digits=3, eps=0.001))
+        s
+    } else {
+        render.default(x=x, name=name, ...)
+    }
+}
+
+rndr.strat <- function(label, n, ...) {
+    ifelse(n==0, label, render.strat.default(label, n, ...))
+}
+
+
+#str(subset(bio_dat,select = -c(dx_correct)))
+## summary and correlation table for dataset
+table1(~.|dx_correct_1, data=subset(bio_dat,select = -c(dx_correct)),render = rndr,type = "pvalues",droplevels = F,test=T)
+```
+
+### categorical variables
+```{r warning=FALSE,message = FALSE}
+options(scipen=999,digits=4)
+bio_dat_update<-bio_dat[,c("dx_correct","post_inv_any","t2_disk_intensity","t2_bone_intensity","t2_endplate_intensity","disk_inv","abscess_soft_tissue_mass_defined","abscess_wall","kyphosis_deform","odema","loss_height","age","new_abscess_wall_thick","abscess_vol","new_t2_bone_intensity","abscess_wall_thick","abscess_septation")]
+
+## convert character to factor
+bio_dat_update[sapply(bio_dat_update,is.character)] <- lapply(bio_dat_update[sapply(bio_dat_update, is.character)],as.factor)
+
+## Remove the rows with missing values
+bio_dat_update_1<-bio_dat_update[complete.cases(bio_dat_update),]
+
+cat_var<-bio_dat_update_1 %>% select_if(is.factor)
+cat_names<-colnames(cat_var)
+
+cat_corr<-as.data.frame(lapply(1:length(cat_names), function(i) mapply(function(x, y) chisq.test(table(cat_var[[x]],cat_var[[y]]))[["p.value"]],
+       cat_names[i], 
+       cat_names)),row.names
+=cat_names,col.names = cat_names
+)
+
+kable(cat_corr, align = "lccrr",digits = 3, format.args = list(scientific = FALSE))
+```
+
+### continuous variables
+```{r warning=FALSE,message = FALSE}
+library(GGally)
+con_var<-bio_dat_update_1 %>% select_if(is.numeric)
+con_var %>% ggpairs()+theme(axis.text.x = element_text(vjust = 1, color = "black",font_size(12)))
+```
+
+
+
+
+# Logistic modelling
+Our objective is to fit logistic models with original (**t2_bone_intensity** **abscess_wall_thick**) and modified c(**new_t2_bone_intensity** **new_abscess_wall_thick**) potentially with useful(significant) interaction terms. 
+
+Models are sequentially selected by removing interaction terms one at a time(those with huge standard error are preferred).
+
+Finally we arrived at two models based on the set of variables that includes c(**new_t2_bone_intensity** **new_abscess_wall_thick**).
+
+## model1.1
+```{r warning=FALSE,message = FALSE}
+bio_dat_update1<-subset(bio_dat_update_1,select = -c(new_t2_bone_intensity,new_abscess_wall_thick)) # without new_t2_bone_intensity and new_abscess_wall_thick
+
+bio_dat_update2<-subset(bio_dat_update_1,select = -c(t2_bone_intensity,abscess_wall_thick)) # without t2_bone_intensity and abscess_wall_thick
+
+bio_dat_update_1<-bio_dat_update_1[bio_dat_update_1$disk_inv!="No",]
+bio_dat_update1<-subset(bio_dat_update_1,select = -c(new_t2_bone_intensity,new_abscess_wall_thick)) # without new_t2_bone_intensity
+bio_dat_update2<-subset(bio_dat_update_1,select = -c(t2_bone_intensity,abscess_wall_thick)) # without t2_bone_intensity
+
+
+mod_1<-glm(formula = dx_correct ~ post_inv_any + disk_inv + kyphosis_deform + 
+    odema + loss_height + age + new_abscess_wall_thick+ 
+    new_t2_bone_intensity + abscess_septation + post_inv_any:kyphosis_deform, family = poisson(link = "log"), data = bio_dat_update2)
+
+mod_2<-glm(formula = dx_correct ~ post_inv_any, family = poisson(link = "log"), data = bio_dat_update2)
+
+#PseudoR2(mod_1,which ="Nagelkerke")
+tab_model(mod_1,show.intercept = TRUE,
+  show.est = TRUE,show.se = TRUE,show.aic=TRUE,collapse.ci = TRUE,show.r2 = FALSE,title ="Summary of the Best Model")
+
+
+```
+
+## model1.2
+```{r warning=FALSE,message = FALSE}
+mod_2<-glm(formula = dx_correct ~ post_inv_any + disk_inv + kyphosis_deform + 
+    odema + loss_height + age + new_abscess_wall_thick + 
+    new_t2_bone_intensity + abscess_septation + post_inv_any:kyphosis_deform + 
+    post_inv_any:age + post_inv_any:new_t2_bone_intensity + 
+    disk_inv:odema , family = binomial, data = bio_dat_update2)
+summary(mod_2)
+options(scipen=999,digits=4)
+exp(cbind(OR =coef(mod_2),confint(mod_2)))
+
+
+
+confint(mod_2)
+coef(mod_2)
+mod_2$coefficients
+summary(mod_2)
+
+z <-qnorm(0.975)
+fitted_co <- coef(mod_2)[4]
+se <- sqrt(diag(vcov(mod_2)))[4]
+ci <- fitted_co + c(-z, z) * se
+ci
+summary(mod_2)
+exp(fitted_co)
+
+confint(mod_2)
+exp(confint.default(mod_2))
+
+a <-7.14
+se <- 3.35
+ci <- a + c(-z, z) * se
+ci
+exp(ci)
+
+tab_model(mod_2)
+#PseudoR2(mod_2,which ="Nagelkerke") 
+```
+
+
+# Conclusion {-}
+Based on the output of the logistic models that we fitted, we preferred to go with/ 
+model1.2 with an AIC = 41.29 and Nagelkerke pseudo R2 = 0.778 instead of model 1.1 with an AIC = 40.4 and pseudo R2 = 0.863 because model1.2 has more significant terms and terms with lower p-values in general than that of model1.2. in addition,model 1.1 has multiple insignificant interaction terms, which are problematic for inference.
+
+
+
+
